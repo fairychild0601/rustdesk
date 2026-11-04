@@ -311,7 +311,7 @@ impl<T: InvokeUiCM> ConnectionManager<T> {
         if close {
             CLIENTS.write().unwrap().remove(&id);
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            if CLIENTS.read().unwrap().is_empty() {
+            if !has_active_clients() {
                 arm_idle_exit_watchdog();
             }
         } else {
@@ -320,6 +320,10 @@ impl<T: InvokeUiCM> ConnectionManager<T> {
                 .unwrap()
                 .get_mut(&id)
                 .map(|c| c.disconnected = true);
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            if !has_active_clients() {
+                arm_idle_exit_watchdog();
+            }
         }
 
         #[cfg(target_os = "windows")]
@@ -422,7 +426,7 @@ pub fn close_window(id: i32) {
 pub fn remove(id: i32) {
     CLIENTS.write().unwrap().remove(&id);
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    if CLIENTS.read().unwrap().is_empty() {
+    if !has_active_clients() {
         arm_idle_exit_watchdog();
     }
 }
@@ -1852,6 +1856,13 @@ pub fn close_voice_call(id: i32) {
     };
 }
 
+/// True if any client is still connected (a retained `disconnected` entry
+/// does not count).
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn has_active_clients() -> bool {
+    CLIENTS.read().unwrap().values().any(|c| !c.disconnected)
+}
+
 /// Spawns a one-shot watchdog that exits the CM via `quit_cm()` if no client
 /// is connected within `CM_IDLE_EXIT_TIMEOUT`. See `CM_IDLE_EXIT_ARMED`.
 /// `pub` so it can be armed from the `--cm` entry point before the
@@ -1864,34 +1875,43 @@ pub fn arm_idle_exit_watchdog() {
     {
         return;
     }
-    if std::thread::Builder::new()
+    match std::thread::Builder::new()
         .name("cm-idle-exit".into())
         .spawn(|| {
-            log::info!(
+            log::trace!(
                 "cm: idle-exit watchdog started ({}s)",
                 CM_IDLE_EXIT_TIMEOUT.as_secs()
             );
             let deadline = std::time::Instant::now() + CM_IDLE_EXIT_TIMEOUT;
             while std::time::Instant::now() < deadline {
-                if !CLIENTS.read().unwrap().is_empty() {
+                if has_active_clients() {
                     CM_IDLE_EXIT_ARMED.store(false, Ordering::SeqCst);
+                    // The last client may have been removed between the check
+                    // above and the store: re-arm so the empty CM still gets
+                    // a watchdog.
+                    if !has_active_clients() {
+                        arm_idle_exit_watchdog();
+                    }
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
-            if CLIENTS.read().unwrap().is_empty() {
+            if !has_active_clients() {
                 log::info!(
-                    "cm: no clients for {:?}, exiting (UI did not close the window)",
+                    "cm: no active clients for {:?}, exiting (UI did not close the window)",
                     CM_IDLE_EXIT_TIMEOUT
                 );
                 quit_cm();
             }
             CM_IDLE_EXIT_ARMED.store(false, Ordering::SeqCst);
         })
-        .is_err()
     {
-        // Thread creation failed: allow a later call to retry.
-        CM_IDLE_EXIT_ARMED.store(false, Ordering::SeqCst);
+        Ok(_) => {}
+        Err(e) => {
+            log::error!("cm: failed to spawn idle-exit watchdog thread: {e}");
+            // Thread creation failed: allow a later call to retry.
+            CM_IDLE_EXIT_ARMED.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -1924,6 +1944,56 @@ mod tests {
     use base::message_proto::{FileDirectory, Message};
     use hbb_common::tokio::{runtime::Runtime, sync::mpsc::unbounded_channel};
     use std::fs;
+
+    #[test]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn idle_exit_watchdog_disarms_with_active_client() {
+        // Regression test for #15698: while a client is active, the
+        // idle-exit watchdog must disarm promptly instead of scheduling
+        // the exit. (If it did not, it would call `quit_cm()` after the
+        // timeout, which ends the process in a real build.)
+        let (tx, _rx) = unbounded_channel();
+        let client = Client {
+            id: 1,
+            authorized: true,
+            disconnected: false,
+            is_file_transfer: false,
+            is_view_camera: false,
+            is_terminal: false,
+            port_forward: String::new(),
+            name: String::new(),
+            avatar: String::new(),
+            peer_id: String::new(),
+            keyboard: false,
+            clipboard: false,
+            audio: false,
+            file: false,
+            restart: false,
+            recording: false,
+            block_input: false,
+            privacy_mode: false,
+            from_switch: false,
+            in_voice_call: false,
+            incoming_voice_call: false,
+            tx,
+        };
+        let client_id = client.id;
+        CLIENTS.write().unwrap().insert(client_id, client);
+        arm_idle_exit_watchdog();
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            if !CM_IDLE_EXIT_ARMED.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(!CM_IDLE_EXIT_ARMED.load(Ordering::SeqCst));
+        assert!(
+            start.elapsed() < CM_IDLE_EXIT_TIMEOUT,
+            "watchdog did not disarm promptly"
+        );
+        CLIENTS.write().unwrap().remove(&client_id);
+    }
 
     #[test]
     #[cfg(not(any(target_os = "ios")))]
